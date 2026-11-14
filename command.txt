@@ -1,0 +1,224 @@
+python -m uv add boto3 --package recommendation-lambda
+
+SQL Script 
+//created roles
+
+CREATE ROLE activityual_admin LOGIN PASSWORD 'admin_pw';
+CREATE ROLE auth_service_user LOGIN PASSWORD 'auth_pw';
+CREATE ROLE activity_service_user LOGIN PASSWORD 'activity_pw';
+CREATE ROLE tracking_service_user LOGIN PASSWORD 'tracking_pw';
+CREATE ROLE outbox_publisher_user LOGIN PASSWORD 'publisher_pw';
+
+//garnt permission to activityual_admin for creating things in db 
+GRANT CREATE ON DATABASE activityual TO activityual_admin;
+
+//created the schemas
+
+CREATE SCHEMA auth_schema AUTHORIZATION activityual_admin;
+CREATE SCHEMA activity_schema AUTHORIZATION activityual_admin;
+CREATE SCHEMA tracking_schema AUTHORIZATION activityual_admin;
+CREATE SCHEMA outbox_schema AUTHORIZATION activityual_admin;
+
+GRANT USAGE ON SCHEMA auth_schema     TO auth_service_user;
+GRANT USAGE ON SCHEMA activity_schema TO activity_service_user;
+GRANT USAGE ON SCHEMA tracking_schema TO tracking_service_user;
+GRANT USAGE ON SCHEMA outbox_schema   TO activity_service_user, tracking_service_user, outbox_publisher_user;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE activityual_admin IN SCHEMA auth_schema
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO auth_service_user;
+ALTER DEFAULT PRIVILEGES FOR ROLE activityual_admin IN SCHEMA activity_schema
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO activity_service_user;
+ALTER DEFAULT PRIVILEGES FOR ROLE activityual_admin IN SCHEMA tracking_schema
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO tracking_service_user;
+
+-- Grant full CRUD privileges on the specific table
+GRANT SELECT, INSERT, UPDATE, DELETE ON auth_schema.app_user TO auth_service_user;
+
+-- If your table uses an auto-incrementing sequence or ID column, grant usage on it too:
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA auth_schema TO auth_service_user;
+------------------------------------
+// Create the table in auth_schema 
+------------------------------------
+Create Table auth_schema.app_user(
+  id            uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  email         text        NOT NULL,
+  password_hash text        NOT NULL,        
+  is_active     boolean     NOT NULL DEFAULT true,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT ck_app_user_email_length CHECK (char_length(email) BETWEEN 3 AND 254),
+  CONSTRAINT ck_app_user_email_lower  CHECK (email = lower(email))
+
+
+  CREATE UNIQUE INDEX ux_app_user_email ON auth_schema.app_user (email);
+
+);
+
+------------------------------------
+// Create the function in activity schema 
+------------------------------------
+
+CREATE FUNCTION activity_schema.is_valid_weekdays(d smallint[]) RETURNS boolean
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT d IS NOT NULL
+     AND cardinality(d) BETWEEN 1 AND 7
+     AND d <@ ARRAY[1,2,3,4,5,6,7]::smallint[]
+     AND (SELECT count(DISTINCT x) FROM unnest(d) AS x) = cardinality(d)
+$$;
+
+
+-----------------------------------
+// Create Table in activity schema
+-----------------------------------
+
+CREATE TABLE activity_schema.activity (
+  id                uuid         PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id           uuid         NOT NULL,
+  title             varchar(100) NOT NULL,
+  category          varchar(50)  NOT NULL DEFAULT 'general',
+  notes             varchar(1000) NOT NULL DEFAULT '',
+  frequency_type    text         NOT NULL,
+  days_of_week      smallint[]   NOT NULL,   
+  timezone          text         NOT NULL,     
+  start_date        date         NOT NULL,    
+  end_date          date,
+  is_active         boolean      NOT NULL DEFAULT true,
+  schedule_revision integer      NOT NULL DEFAULT 1,
+  created_at        timestamptz  NOT NULL DEFAULT now(),
+  updated_at        timestamptz  NOT NULL DEFAULT now(),
+  CONSTRAINT ck_activity_title_not_blank CHECK (char_length(btrim(title)) >= 1),
+  CONSTRAINT ck_activity_frequency       CHECK (frequency_type IN ('DAILY', 'WEEKLY')),
+  CONSTRAINT ck_activity_weekdays        CHECK (activity_schema.is_valid_weekdays(days_of_week)),
+  CONSTRAINT ck_activity_daily_all_days  CHECK (frequency_type <> 'DAILY'
+                                                OR days_of_week = ARRAY[1,2,3,4,5,6,7]::smallint[]),
+  CONSTRAINT ck_activity_dates           CHECK (end_date IS NULL OR end_date >= start_date),
+  CONSTRAINT ck_activity_revision        CHECK (schedule_revision >= 1)
+);
+
+
+CREATE INDEX ix_activity_user_list ON activity_schema.activity (user_id, created_at DESC, id DESC);
+
+
+---------------------------------
+//Create Table in Tracking Schema 
+--------------------------------
+
+CREATE FUNCTION tracking_schema.is_valid_weekdays(d smallint[]) RETURNS boolean
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT d IS NOT NULL
+     AND cardinality(d) BETWEEN 1 AND 7
+     AND d <@ ARRAY[1,2,3,4,5,6,7]::smallint[]
+     AND (SELECT count(DISTINCT x) FROM unnest(d) AS x) = cardinality(d)
+$$;
+
+CREATE TABLE tracking_schema.activity_schedule (
+  activity_id       uuid        PRIMARY KEY,
+  user_id           uuid        NOT NULL,
+  current_revision  integer     NOT NULL,
+  timezone          text        NOT NULL,       
+  generated_through date,                       
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  updated_at        timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT ck_schedule_current_revision CHECK (current_revision >= 1)
+);
+
+CREATE INDEX ix_schedule_generation ON tracking_schema.activity_schedule (generated_through NULLS FIRST);
+
+
+CREATE TABLE tracking_schema.activity_schedule_revision (
+  activity_id       uuid        NOT NULL REFERENCES tracking_schema.activity_schedule (activity_id) ON DELETE CASCADE,
+  schedule_revision integer     NOT NULL,
+  frequency_type    text        NOT NULL,
+  days_of_week      smallint[]  NOT NULL,
+  timezone          text        NOT NULL,
+  start_date        date        NOT NULL,
+  end_date          date,
+  is_active         boolean     NOT NULL,
+  effective_from    date        NOT NULL,  
+  source_event_id   uuid        NOT NULL,
+  applied_at        timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (activity_id, schedule_revision),
+  CONSTRAINT ck_rev_revision  CHECK (schedule_revision >= 1),
+  CONSTRAINT ck_rev_frequency CHECK (frequency_type IN ('DAILY', 'WEEKLY')),
+  CONSTRAINT ck_rev_weekdays  CHECK (tracking_schema.is_valid_weekdays(days_of_week)),
+  CONSTRAINT ck_rev_dates     CHECK (end_date IS NULL OR end_date >= start_date)
+);
+
+CREATE TABLE tracking_schema.occurrence (
+  id             uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  activity_id    uuid        NOT NULL,
+  user_id        uuid        NOT NULL,
+  scheduled_date date        NOT NULL,           
+  timezone       text        NOT NULL,           
+  due_start_at   timestamptz NOT NULL,           
+  due_end_at     timestamptz NOT NULL,           
+  state          text        NOT NULL DEFAULT 'PENDING',
+  completed_at   timestamptz,
+  resolved_at    timestamptz,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT ux_occurrence_activity_date UNIQUE (activity_id, scheduled_date),   -- makes generation idempotent
+  CONSTRAINT ck_occurrence_window CHECK (due_end_at > due_start_at),
+  CONSTRAINT ck_occurrence_state  CHECK (state IN ('PENDING', 'COMPLETED', 'SKIPPED', 'MISSED')),
+  CONSTRAINT ck_occurrence_state_columns CHECK (
+       (state = 'PENDING'               AND resolved_at IS NULL     AND completed_at IS NULL)
+    OR (state = 'COMPLETED'             AND resolved_at IS NOT NULL AND completed_at IS NOT NULL)
+    OR (state IN ('SKIPPED', 'MISSED')  AND resolved_at IS NOT NULL AND completed_at IS NULL)
+  )
+);
+
+CREATE INDEX ix_occurrence_user_date ON tracking_schema.occurrence (user_id, scheduled_date DESC, id DESC);
+CREATE INDEX ix_occurrence_pending_due ON tracking_schema.occurrence (due_end_at) WHERE state = 'PENDING';
+
+
+------------------------------------
+// Creating Table in outbox schema 
+------------------------------------
+CREATE TABLE outbox_schema.outbox (
+  id              bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  event_id        uuid        NOT NULL,
+  event_type      text        NOT NULL,
+  event_version   integer     NOT NULL DEFAULT 1,
+  producer        text        NOT NULL,
+  payload         jsonb       NOT NULL,            
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  status          text        NOT NULL DEFAULT 'PENDING',
+  attempts        integer     NOT NULL DEFAULT 0,
+  next_attempt_at timestamptz NOT NULL DEFAULT now(),
+  locked_until    timestamptz,                          
+  published_at    timestamptz,
+  last_error      text,
+  CONSTRAINT ux_outbox_event_id UNIQUE (event_id),
+  CONSTRAINT ck_outbox_status   CHECK (status IN ('PENDING', 'PUBLISHED', 'DEAD')),
+  CONSTRAINT ck_outbox_producer CHECK (producer IN ('activity-service', 'tracking-service')),
+  CONSTRAINT ck_outbox_event_type CHECK (event_type IN (
+      'ActivityCreated', 'ActivityUpdated', 'ActivityDeactivated',
+      'ActivityCompleted', 'ActivityMissed', 'ActivitySkipped')),
+  CONSTRAINT ck_outbox_envelope CHECK (payload ->> 'eventId' = event_id::text
+                                       AND payload ->> 'eventType' = event_type),
+  CONSTRAINT ck_outbox_published CHECK ((status = 'PUBLISHED') = (published_at IS NOT NULL))
+);
+
+CREATE INDEX ix_outbox_claim ON outbox_schema.outbox (next_attempt_at, id) WHERE status = 'PENDING';
+CREATE INDEX ix_outbox_published ON outbox_schema.outbox (published_at) WHERE status = 'PUBLISHED';
+
+
+CREATE FUNCTION outbox_schema.enforce_producer() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF current_user = 'activity_service_user'
+     AND NEW.producer = 'activity-service'
+     AND NEW.event_type IN ('ActivityCreated', 'ActivityUpdated', 'ActivityDeactivated') THEN
+    RETURN NEW;
+  ELSIF current_user = 'tracking_service_user'
+     AND NEW.producer = 'tracking-service'
+     AND NEW.event_type IN ('ActivityCompleted', 'ActivityMissed', 'ActivitySkipped') THEN
+    RETURN NEW;
+  END IF;
+  RAISE EXCEPTION 'role % may not write outbox event % for producer %', current_user, NEW.event_type, NEW.producer
+    USING ERRCODE = 'insufficient_privilege';
+END;
+$$;
+
+CREATE TRIGGER trg_outbox_enforce_producer
+  BEFORE INSERT ON outbox_schema.outbox
+  FOR EACH ROW EXECUTE FUNCTION outbox_schema.enforce_producer();

@@ -1,0 +1,4 @@
+.venv
+.local-stack
+__pycache__/
+*.pyc
