@@ -2,3 +2,4 @@
 .local-stack
 __pycache__/
 *.pyc
+.vscode
