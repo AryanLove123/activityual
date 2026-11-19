@@ -1,0 +1,41 @@
+from activityual_common.app_factory import create_service_app
+from activityual_common.db import (
+    make_engine,
+    make_session_factory,
+    session_dependency,
+)
+from activityual_common.security import make_current_user
+from fastapi import FastAPI
+from sqlalchemy import Engine
+
+from ..settings import TrackingApiSettings
+from .routes import build_router
+
+
+def create_app(
+    settings: TrackingApiSettings | None = None, engine: Engine | None = None
+) -> FastAPI:
+    settings = settings or TrackingApiSettings()
+    if engine is None:
+        if settings.database_url is None:
+            raise RuntimeError("DATABASE_URL is required")
+        engine = make_engine(
+            settings.database_url.get_secret_value(),
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+            pool_timeout=settings.db_pool_timeout,
+        )
+
+    factory = make_session_factory(engine)
+    app = create_service_app(
+        title="Activityual Activities", collection="activities", settings=settings
+    )
+    app.include_router(
+        build_router(
+            session_dependency(lambda: factory),
+            make_current_user(settings)
+        )
+    )
+    app.state.engine = engine
+    return app
+ 

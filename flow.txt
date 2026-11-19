@@ -1,0 +1,14 @@
+1. Revision history
+Which schedule was active, and from which date?
+↓
+2. plan_generation()
+Which date range should the worker process in this batch?
+↓
+3. window_for() → day_window()
+Is an occurrence due on that date? If yes, what is its UTC window?
+↓
+4. GenerationPlan
+Return the planned occurrences and the watermark to advance.
+↓
+5. Tracking worker
+Persist occurrences, update the watermark, and repeat if more=True.
